@@ -11,17 +11,19 @@
 #include "driver/i2s_std.h" // PCM5102A
 #include "vl53l5cx_api.h"
 
+#include "definitions.h"
+
 /*
-esp      vl53_1      vl53_2      pcm
-3v3      vin         vin         vin,xsmt
-gnd      gnd         gnd         gnd,sck,fmt,demp,flt
-d21      sda_ok
-d22      scl_ok
-d18                  sda_ok
-d19                  scl_ok
-d27                              din
-d26                              bck
-d25                              lck
+ESP32 DEVKITV1    VL53L5CX 1    VL53L5CX 2    PCM5102A
+3v3               vin           vin           vin,xsmt
+gnd               gnd           gnd           gnd,sck,fmt,demp,flt
+d21               sda
+d22               scl
+d18                             sda
+d19                             scl
+d27                                           din
+d26                                           bck
+d25                                           lck
 
 PCM5102A XSMT mutes on LOW
 */
@@ -38,19 +40,29 @@ PCM5102A XSMT mutes on LOW
 #define TOF2_I2C_PORT           I2C_NUM_1
 #define TOF2_I2C_FREQUENCY_HZ   1000000
 
+#define TOF_GRID_DIM   4 // 8
+#define TOF_RESOLUTION VL53L5CX_RESOLUTION_4X4 //8x8
+
 // PCM5102A
 #define I2S_LCK_GPIO       GPIO_NUM_25
 #define I2S_BCK_GPIO       GPIO_NUM_26
 #define I2S_DIN_GPIO       GPIO_NUM_27
 
 #define SAMPLE_RATE 44100
-#define TONE_FREQ   440
 #define AMPLITUDE   5000
+#define BUFFER_SIZE 512
+
+#define DETECT_MM   150      // 15 cm
+#define NUM_PITCHES 8
+
+// from 0 to 3 for TOF1, and from 4 to 7 for TOF2
+static volatile int note_active[NUM_PITCHES] = {0, 0, 0, 0, 0, 0, 0, 0};
+static const float freq[NUM_PITCHES] = {C4, D4, E4, F4, G4, A4, B4, C5};
 
 void pcm5102a(void *pv) {
-  i2s_chan_handle_t tx_chan;
-
-  i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+  i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(
+    I2S_NUM_0, I2S_ROLE_MASTER
+  );
   chan_cfg.dma_desc_num = 8;
   chan_cfg.dma_frame_num = 256;
   chan_cfg.auto_clear = true;
@@ -74,32 +86,61 @@ void pcm5102a(void *pv) {
     },
   };
 
+  i2s_chan_handle_t tx_chan;
+  static int16_t buffer[BUFFER_SIZE];
+  size_t buffer_len = sizeof(buffer);
+  size_t written;
+
   if(
     i2s_new_channel(&chan_cfg, &tx_chan, NULL) != ESP_OK ||
     i2s_channel_init_std_mode(tx_chan, &std_cfg) != ESP_OK ||
+    i2s_channel_preload_data(tx_chan, buffer, buffer_len, &written) != ESP_OK ||
     i2s_channel_enable(tx_chan) != ESP_OK
   ) {
     printf("Erro ao iniciar I2S\n");
     vTaskDelete(NULL);
   }
 
-  static int16_t buffer[512];
-  float phase = 0.0f;
-  const float step = 2.0f * M_PI * TONE_FREQ / SAMPLE_RATE;
+  float phase[NUM_PITCHES] = {0};
+  float gain[NUM_PITCHES]  = {0};
+  float step[NUM_PITCHES];
+  for(int n = 0; n < NUM_PITCHES; n++) {
+    step[n] = 2.0f * M_PI * freq[n] / SAMPLE_RATE;
+  }
+  const float ramp = 1.0f / (0.01f * SAMPLE_RATE);   // 10 ms fade in/out
 
   while(1) {
+    float target[NUM_PITCHES];
+    for(int n = 0; n < NUM_PITCHES; n++) {
+      target[n] = note_active[n] ? 1.0f : 0.0f;
+    }
+
     for(int i = 0; i < 256; i++) {
-      int16_t s = (int16_t)(AMPLITUDE * sinf(phase));
-      phase += step;
-      if (phase >= 2.0f * M_PI) phase -= 2.0f * M_PI;
+      float mix = 0.0f;
+      float gsum = 0.0f;
+      for(int n = 0; n < NUM_PITCHES; n++) {
+        if(gain[n] < target[n]) {
+          gain[n] += ramp;
+          if(gain[n] > target[n]) gain[n] = target[n];
+        } else if(gain[n] > target[n]) {
+          gain[n] -= ramp;
+          if(gain[n] < target[n]) gain[n] = target[n];
+        }
+
+        mix  += gain[n] * sinf(phase[n]);
+        gsum += gain[n];
+        phase[n] += step[n];
+        if(phase[n] >= 2.0f * M_PI) phase[n] -= 2.0f * M_PI;
+      }
+      int16_t s = (int16_t)(AMPLITUDE * mix / (1.0f + gsum));
       buffer[2 * i] = buffer[2 * i + 1] = s;
     }
-    size_t written;
-    i2s_channel_write(tx_chan, buffer, sizeof(buffer), &written, portMAX_DELAY);
+    i2s_channel_write(tx_chan, buffer, buffer_len, &written, portMAX_DELAY);
   }
 }
 
 typedef struct {
+  uint8_t id;               // index into note_active[]
   gpio_num_t sda_gpio;
   gpio_num_t scl_gpio;
   i2c_port_t i2c_port;
@@ -112,7 +153,8 @@ static vl53l5cx_platform_t tof1_platform = {
   .scl_gpio = TOF1_I2C_SCL_GPIO,
   .i2c_port = TOF1_I2C_PORT,
   .i2c_frequency_hz = TOF1_I2C_FREQUENCY_HZ,
-  .name = "TOF1"
+  .name = "TOF1",
+  .id = 0
 };
 
 static vl53l5cx_platform_t tof2_platform = {
@@ -120,8 +162,26 @@ static vl53l5cx_platform_t tof2_platform = {
   .scl_gpio = TOF2_I2C_SCL_GPIO,
   .i2c_port = TOF2_I2C_PORT,
   .i2c_frequency_hz = TOF2_I2C_FREQUENCY_HZ,
-  .name = "TOF2"
+  .name = "TOF2",
+  .id = 1
 };
+
+static int zone_touched(
+  const VL53L5CX_ResultsData *data_from_fov,
+  uint16_t dist_limit_mm,
+  int n_zones, int col_start, int col_end
+) {
+  for(int row = 0; row < n_zones; row++) {
+    for(int col = col_start; col < col_end; col++) {
+      int z = row * n_zones + col;
+      uint16_t idx = VL53L5CX_NB_TARGET_PER_ZONE * z;
+      uint8_t st = data_from_fov->target_status[idx];
+      uint16_t d = data_from_fov->distance_mm[idx];
+      if((st == 5 || st == 9) && d > 0 && d < dist_limit_mm) return 1;
+    }
+  }
+  return 0;
+}
 
 void vl53l5c(void *pvParameters) {
   vl53l5cx_platform_t *platform = (vl53l5cx_platform_t *)pvParameters;
@@ -156,7 +216,7 @@ void vl53l5c(void *pvParameters) {
       platform->name,
       esp_err_to_name(err)
     );
-    return;
+    vTaskDelete(NULL);
   }
 
   i2c_device_config_t device_config = {
@@ -170,14 +230,13 @@ void vl53l5c(void *pvParameters) {
     &device_config,
     &Dev->platform.handle
   );
-
   if(err != ESP_OK) {
     printf(
       "[%s] Erro ao adicionar dispositivo I2C: %s\n",
       platform->name,
       esp_err_to_name(err)
     );
-    return;
+    vTaskDelete(NULL);
   }
 
   Dev->platform.bus_config = i2c_config;
@@ -187,79 +246,87 @@ void vl53l5c(void *pvParameters) {
   printf("[%s] Verificando sensor VL53L5CX...\n", platform->name);
 
   status = vl53l5cx_is_alive(Dev, &is_alive);
-
   if(status != VL53L5CX_STATUS_OK || !is_alive) {
     printf(
       "[%s] VL53L5CX nao detectado. Verifique as conexoes.\n",
       platform->name
     );
-    return;
+    vTaskDelete(NULL);
   }
 
   printf("[%s] Sensor detectado!\n", platform->name);
   printf("[%s] Inicializando driver...\n", platform->name);
 
   status = vl53l5cx_init(Dev);
-
   if(status != VL53L5CX_STATUS_OK) {
     printf(
       "[%s] Falha ao inicializar o sensor. Status: %u\n",
       platform->name, status
     );
-    return;
+    vTaskDelete(NULL);
   }
 
-  status = vl53l5cx_set_resolution(
-    Dev,
-    VL53L5CX_RESOLUTION_4X4
-  );
-
+  status = vl53l5cx_set_resolution(Dev, TOF_RESOLUTION);
   if(status != VL53L5CX_STATUS_OK) {
     printf(
       "[%s] Erro ao configurar resolucao 4x4: %u\n",
       platform->name, status);
-    return;
+    vTaskDelete(NULL);
   }
 
-  status = vl53l5cx_set_ranging_frequency_hz(Dev, 1);
-
+  status = vl53l5cx_set_ranging_frequency_hz(Dev, 30);
   if(status != VL53L5CX_STATUS_OK) {
     printf(
       "[%s] Erro ao configurar frequencia: %u\n",
       platform->name, status
     );
-    return;
+    vTaskDelete(NULL);
   }
 
   status = vl53l5cx_start_ranging(Dev);
-
   if(status != VL53L5CX_STATUS_OK) {
     printf("[%s] Erro ao iniciar medicao: %u\n", platform->name, status);
-    return;
+    vTaskDelete(NULL);
   }
 
   printf("\n[%s] Sensor iniciado. Lendo 16 zonas...\n", platform->name);
-
   while(1) {
     is_ready = 0;
-
     status = vl53l5cx_check_data_ready(Dev, &is_ready);
 
     if(status == VL53L5CX_STATUS_OK && is_ready) {
       status = vl53l5cx_get_ranging_data(Dev, Results);
+      if(status == VL53L5CX_STATUS_OK) {        
+        /*
+        platform->id: 0 for TOF1 and 1 for TOF2 as defined in vl53l5cx_platform_t
+        multiplies by 4 to achieve the correspondent index in note_active[], which are 0 for TOF1 and 4 for TOF2
+        sums 1 to go from the first to the last notes of each TOF in note_active[]
+        */
+        int base_index = platform->id * 4; // index for the TOF first tone
+        note_active[base_index++] = zone_touched(
+          Results, DETECT_MM, TOF_GRID_DIM, 0, 1
+        ); // left
+        note_active[base_index++] = zone_touched(
+          Results, DETECT_MM, TOF_GRID_DIM, 1, 2
+        ); // mid-left
+        note_active[base_index++] = zone_touched(
+          Results, DETECT_MM, TOF_GRID_DIM, 2, 3
+        ); // mid-right
+        note_active[base_index] = zone_touched(
+          Results, DETECT_MM, TOF_GRID_DIM, 3, 4
+        ); // right
 
-      if(status == VL53L5CX_STATUS_OK) {
-        printf("\nQuadro: %u\n", Dev->streamcount);
-        for(zone = 0; zone < 16; zone++) {
-          uint16_t index = VL53L5CX_NB_TARGET_PER_ZONE * zone;
-          printf(
-            "[%s] Zona %2u | Status: %u | Distancia: %d mm\n",
-            platform->name,
-            zone,
-            Results->target_status[index],
-            Results->distance_mm[index]
-          );
-        }
+        // printf("\nQuadro: %u\n", Dev->streamcount);
+        // for(zone = 0; zone < 16; zone++) {
+        //   uint16_t index = VL53L5CX_NB_TARGET_PER_ZONE * zone;
+        //   printf(
+        //     "[%s] Zona %2u | Status: %u | Distancia: %d mm\n",
+        //     platform->name,
+        //     zone,
+        //     Results->target_status[index],
+        //     Results->distance_mm[index]
+        //   );
+        // }
       } else {
         printf("[%s] Erro ao obter dados: %u\n", platform->name, status);
       }
