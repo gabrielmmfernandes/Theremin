@@ -1,0 +1,25 @@
+#define C4  261.63f
+#define Cs4 277.18f
+#define D4  293.66f
+#define Ds4 311.13f
+#define E4  329.63f
+#define F4  349.23f
+#define Fs4 369.99f
+#define G4  392.00f
+#define Gs4 415.30f
+#define A4  440.00f
+#define As4 466.16f
+#define B4  493.88f
+
+#define C5  523.25f
+#define Cs5 554.37f
+#define D5  587.33f
+#define Ds5 622.25f
+#define E5  659.25f
+#define F5  698.46f
+#define Fs5 739.99f
+#define G5  783.99f
+#define Gs5 830.61f
+#define A5  880.00f
+#define As5 932.33f
+#define B5  987.77f

@@ -22,8 +22,8 @@
   "idf.openOcdConfigs": [
     "board/esp32-wrover-kit-3.3v.cfg"
   ],
-  "idf.port": "COM5",
-  "idf.currentSetup": "C:\\esp\\v6.1\\esp-idf",
+  "idf.port": "/dev/ttyUSB0",
+  "idf.currentSetup": "/home/joaop/.espressif/v6.1/esp-idf",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32"
   },
